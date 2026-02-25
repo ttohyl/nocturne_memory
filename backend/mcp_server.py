@@ -15,9 +15,8 @@ Multiple paths can point to the same memory (aliases).
 import os
 import re
 import sys
-import uuid
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 
 # Ensure we can import from backend modules
@@ -26,7 +25,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from db.sqlite_client import get_db_client, close_db_client
-from db.snapshot import get_snapshot_manager
+from db.snapshot import get_changeset_store
 import contextlib
 
 # Load environment variables
@@ -90,13 +89,6 @@ CORE_MEMORY_URIS = [
     if uri.strip()
 ]
 
-# Session ID for this MCP server instance
-_SESSION_ID = f"mcp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-
-
-def get_session_id() -> str:
-    """Get the current session ID for snapshot tracking."""
-    return _SESSION_ID
 
 
 # =============================================================================
@@ -160,212 +152,23 @@ def make_uri(domain: str, path: str) -> str:
 
 
 # =============================================================================
-# Snapshot Helpers
-# =============================================================================
-#
-# Snapshots are split into two dimensions matching the two DB tables:
-#
-#   1. PATH snapshots (resource_id = URI, resource_type = "path")
-#      Track changes to the paths table: create, create_alias, delete, modify_meta
-#
-#   2. MEMORY CONTENT snapshots (resource_id = "memory:{id}", resource_type = "memory")
-#      Track changes to the memories table: modify_content
-#
-# This separation ensures that path-level operations (e.g. add_alias) never
-# collide with content-level operations (e.g. update_memory), fixing the bug
-# where an alias snapshot blocked the content snapshot for the same URI.
+# Changeset Helpers — before/after state capture with overwrite semantics
 # =============================================================================
 
 
-async def _snapshot_memory_content(uri: str) -> bool:
+def _record_rows(
+    before_state: Dict[str, List[Dict[str, Any]]],
+    after_state: Dict[str, List[Dict[str, Any]]],
+):
     """
-    Snapshot memory content before modification.
+    Feed row-level before/after states into the ChangesetStore.
 
-    Uses memory:{id} as resource_id so it never collides with path snapshots.
-    Idempotent per URI per session: when a memory is updated multiple times,
-    each update produces a new memory_id (version chain), but only the FIRST
-    version is snapshotted.  Subsequent updates to the same URI are no-ops.
-
-    This prevents orphaned snapshots when create+delete cancel out: without
-    this, create → update(×N) → delete would leave N-2 unreachable
-    "memory:{intermediate_id}" snapshots in the manifest.
+    Overwrite semantics are handled by the store:
+    - First touch of a PK: stores both before and after.
+    - Subsequent touches: overwrites after only; before is frozen.
     """
-    manager = get_snapshot_manager()
-    session_id = get_session_id()
-
-    domain, path = parse_uri(uri)
-    full_uri = make_uri(domain, path)
-    client = get_db_client()
-    memory = await client.get_memory_by_path(path, domain)
-
-    if not memory:
-        return False
-
-    resource_id = f"memory:{memory['id']}"
-
-    # Fast path: exact match (same memory_id, no version change yet)
-    if manager.has_snapshot(session_id, resource_id):
-        return False
-
-    # Slow path: check if an earlier version of this URI was already
-    # snapshotted (e.g. memory:1 exists but current id is now 5).
-    if manager.find_memory_snapshot_by_uri(session_id, full_uri):
-        return False
-
-    # Collect all paths pointing to this memory for fallback during rollback.
-    # If the primary path is later deleted, rollback can use an alternative.
-    memory_full = await client.get_memory_by_id(memory["id"])
-    all_paths = memory_full.get("paths", []) if memory_full else []
-
-    return manager.create_snapshot(
-        session_id=session_id,
-        resource_id=resource_id,
-        resource_type="memory",
-        snapshot_data={
-            "operation_type": "modify_content",
-            "memory_id": memory["id"],
-            # Content is NOT stored here — the old Memory row is preserved
-            # in DB (deprecated=True, migrated_to=new_id) and can be read
-            # via get_memory_version(memory_id) when computing diffs.
-            "uri": full_uri,
-            "domain": domain,
-            "path": path,
-            "all_paths": all_paths,
-        },
-    )
-
-
-async def _snapshot_path_meta(uri: str) -> bool:
-    """
-    Snapshot path metadata (priority/disclosure) before modification.
-    Uses URI as resource_id.
-    """
-    manager = get_snapshot_manager()
-    session_id = get_session_id()
-
-    if manager.has_snapshot(session_id, uri):
-        return False
-
-    domain, path = parse_uri(uri)
-    client = get_db_client()
-    memory = await client.get_memory_by_path(path, domain)
-
-    if not memory:
-        return False
-
-    return manager.create_snapshot(
-        session_id=session_id,
-        resource_id=uri,
-        resource_type="path",
-        snapshot_data={
-            "operation_type": "modify_meta",
-            "domain": domain,
-            "path": path,
-            "uri": uri,
-            "memory_id": memory["id"],
-            "priority": memory.get("priority"),
-            "disclosure": memory.get("disclosure"),
-        },
-    )
-
-
-async def _snapshot_path_create(
-    uri: str,
-    memory_id: int,
-    operation_type: str = "create",
-    target_uri: Optional[str] = None,
-) -> bool:
-    """
-    Record that a path was created (for rollback = remove the path).
-
-    Used by both create_memory (operation_type="create") and
-    add_alias (operation_type="create_alias").
-    """
-    manager = get_snapshot_manager()
-    session_id = get_session_id()
-
-    domain, path = parse_uri(uri)
-
-    data = {
-        "operation_type": operation_type,
-        "domain": domain,
-        "path": path,
-        "uri": uri,
-        "memory_id": memory_id,
-    }
-    if target_uri:
-        data["target_uri"] = target_uri
-
-    return manager.create_snapshot(
-        session_id=session_id, resource_id=uri, resource_type="path", snapshot_data=data
-    )
-
-
-async def _snapshot_path_delete(uri: str) -> bool:
-    """
-    Record that a path is being deleted (for rollback = re-create).
-
-    Two cases depending on what path snapshot already exists for this URI:
-
-    1. Existing "create"/"create_alias" snapshot (create->delete in same session):
-       Net effect is nothing happened. Remove the snapshot entirely.
-
-    2. No prior path snapshot, or a "modify_meta" snapshot:
-       Capture the CURRENT state as a "delete" snapshot (force overwrite).
-       This stores the pre-delete memory_id, metadata, and content for
-       both rollback and diff display.
-    """
-    manager = get_snapshot_manager()
-    session_id = get_session_id()
-
-    # Check for cancellation with prior create
-    existing = manager.get_snapshot(session_id, uri)
-    if existing:
-        existing_op = existing.get("data", {}).get("operation_type")
-        if existing_op in ("create", "create_alias"):
-            # create + delete = no-op. Remove path snapshot.
-            # Also clean up the content snapshot (at most one per URI,
-            # guaranteed by _snapshot_memory_content's URI-level dedup).
-            content_snap_id = manager.find_memory_snapshot_by_uri(session_id, uri)
-            if content_snap_id:
-                manager.delete_snapshot(session_id, content_snap_id)
-            manager.delete_snapshot(session_id, uri)
-            return False
-
-    # Capture current state before deletion
-    domain, path = parse_uri(uri)
-    client = get_db_client()
-    memory = await client.get_memory_by_path(path, domain)
-
-    if not memory:
-        return False
-
-    # If overwriting a modify_meta snapshot, preserve the original (pre-session)
-    # metadata instead of the current (post-modification) values.
-    # This maintains the "first modification before session" invariant.
-    priority = memory.get("priority")
-    disclosure = memory.get("disclosure")
-    if existing and existing.get("data", {}).get("operation_type") == "modify_meta":
-        priority = existing["data"].get("priority", priority)
-        disclosure = existing["data"].get("disclosure", disclosure)
-
-    return manager.create_snapshot(
-        session_id=session_id,
-        resource_id=uri,
-        resource_type="path",
-        snapshot_data={
-            "operation_type": "delete",
-            "domain": domain,
-            "path": path,
-            "uri": uri,
-            "memory_id": memory["id"],
-            "priority": priority,
-            "disclosure": disclosure,
-            # Content is NOT stored here — retrievable from DB via memory_id
-            # (the Memory row persists as deprecated until permanently deleted).
-        },
-        force=True,
-    )
+    store = get_changeset_store()
+    store.record_many(before_state, after_state)
 
 
 # =============================================================================
@@ -386,10 +189,11 @@ async def _fetch_and_format_memory(client, uri: str) -> str:
     if not memory:
         raise ValueError(f"URI '{make_uri(domain, path)}' not found.")
 
-    # Get children across ALL paths (aliases) of this memory.
-    # Once you reach a memory, the sub-memories you see depend on
-    # what the memory IS, not which path you used to get here.
-    children = await client.get_children(memory["id"])
+    children = await client.get_children(
+        memory["node_uuid"],
+        context_domain=domain,
+        context_path=path,
+    )
 
     # Format output
     lines = []
@@ -507,34 +311,44 @@ async def _generate_boot_memory_view() -> str:
 async def _generate_memory_index_view() -> str:
     """
     Internal helper to generate the full memory index.
-    (Formerly fiat-lux://index)
+
+    Node-centric: each conceptual entity (node_uuid) appears once,
+    with aliases folded underneath its primary path.
     """
     client = get_db_client()
 
     try:
         paths = await client.get_all_paths()
 
-        lines = []
-        lines.append("# Memory Index")
-        lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"# Total entries: {len(paths)}")
-        lines.append(
-            "# Legend: [#ID] = Memory ID (same ID = alias), [★N] = priority (lower = higher priority)"
-        )
-        lines.append("")
-
-        # Group by domain first, then by top-level path segment
-        domains = {}
+        # --- Step 1: Group all paths by node_uuid ---
+        node_groups: Dict[str, List[Dict[str, Any]]] = {}
         for item in paths:
-            domain = item.get("domain", DEFAULT_DOMAIN)
-            if domain not in domains:
-                domains[domain] = {}
+            nid = item.get("node_uuid", "")
+            node_groups.setdefault(nid, []).append(item)
 
-            path = item["path"]
-            top_level = path.split("/")[0] if path else "(root)"
-            if top_level not in domains[domain]:
-                domains[domain][top_level] = []
-            domains[domain][top_level].append(item)
+        # --- Step 2: Pick primary path per node, collect aliases ---
+        # Primary = lowest priority value → shortest path → alphabetical URI.
+        entries = []  # list of (primary_item, [alias_items])
+        for _nid, items in node_groups.items():
+            items.sort(key=lambda x: (x.get("priority", 0), len(x["path"]), x.get("uri", "")))
+            entries.append((items[0], items[1:]))
+
+        # --- Step 3: Organise primaries by domain → top-level segment ---
+        domains: Dict[str, Dict[str, list]] = {}
+        for primary, aliases in entries:
+            domain = primary.get("domain", DEFAULT_DOMAIN)
+            domains.setdefault(domain, {})
+            top_level = primary["path"].split("/")[0] if primary["path"] else "(root)"
+            domains[domain].setdefault(top_level, []).append((primary, aliases))
+
+        # --- Step 4: Render ---
+        lines = [
+            "# Memory Index",
+            f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Total: {len(node_groups)} nodes, {len(paths)} paths",
+            "# Legend: [#ID] = Memory ID, [★N] = priority (lower = higher)",
+            "",
+        ]
 
         for domain_name in sorted(domains.keys()):
             lines.append("# ══════════════════════════════════════")
@@ -544,14 +358,18 @@ async def _generate_memory_index_view() -> str:
 
             for group_name in sorted(domains[domain_name].keys()):
                 lines.append(f"## {group_name}")
-                for item in sorted(
-                    domains[domain_name][group_name], key=lambda x: x["path"]
+                for primary, aliases in sorted(
+                    domains[domain_name][group_name],
+                    key=lambda x: x[0]["path"],
                 ):
-                    uri = item.get("uri", make_uri(domain_name, item["path"]))
-                    priority = item.get("priority", 0)
-                    memory_id = item.get("memory_id", "?")
+                    uri = primary.get("uri", make_uri(domain_name, primary["path"]))
+                    priority = primary.get("priority", 0)
+                    memory_id = primary.get("memory_id", "?")
                     imp_str = f" [★{priority}]" if priority > 0 else ""
                     lines.append(f"  - {uri} [#{memory_id}]{imp_str}")
+                    if aliases:
+                        alias_strs = [a.get("uri", make_uri(a["domain"], a["path"])) for a in aliases]
+                        lines.append(f"    aliases: {', '.join(alias_strs)}")
                 lines.append("")
 
         return "\n".join(lines)
@@ -726,9 +544,8 @@ async def create_memory(
             domain=domain,
         )
 
-        # Record path creation for potential rollback
         created_uri = result.get("uri", make_uri(domain, result["path"]))
-        await _snapshot_path_create(created_uri, result["id"], operation_type="create")
+        _record_rows(before_state={}, after_state=result.get("rows_after", {}))
 
         return f"Success: Memory created at '{created_uri}'"
 
@@ -867,18 +684,17 @@ async def update_memory(
                 f"or metadata fields (priority/disclosure)."
             )
 
-        # --- Snapshot before modification (each is idempotent) ---
-        if content is not None:
-            await _snapshot_memory_content(full_uri)
-        if priority is not None or disclosure is not None:
-            await _snapshot_path_meta(full_uri)
-
-        await client.update_memory(
+        result = await client.update_memory(
             path=path,
             content=content,
             priority=priority,
             disclosure=disclosure,
             domain=domain,
+        )
+
+        _record_rows(
+            before_state=result.get("rows_before", {}),
+            after_state=result.get("rows_after", {}),
         )
 
         return f"Success: Memory at '{full_uri}' updated"
@@ -912,82 +728,34 @@ async def delete_memory(uri: str) -> str:
         delete_memory("writer://draft_v1")
     """
     client = get_db_client()
-    manager = get_snapshot_manager()
-    session_id = get_session_id()
-    
-    # Track state for rollback
-    newly_created_snapshots = []  # Snapshots we created during this operation
-    backup_snapshots = []         # Snapshots that existed before we started (to restore on error)
 
     try:
-        # Parse URI
         domain, path = parse_uri(uri)
         full_uri = make_uri(domain, path)
 
-        # Check if it exists first
         memory = await client.get_memory_by_path(path, domain)
         if not memory:
             return f"Error: Memory at '{full_uri}' not found."
 
-        # 1. Identify all targets (self + descendants)
-        targets = [full_uri]
-        
-        all_paths = await client.get_all_paths(domain=domain)
-        safe_prefix = f"{path}/"
-        for p in all_paths:
-            if p["path"].startswith(safe_prefix):
-                child_uri = make_uri(p["domain"], p["path"])
-                targets.append(child_uri)
+        result = await client.remove_path(path, domain)
+        snapshot_before = result.get("snapshot_before", {})
 
-        # 2. Backup existing snapshots for all targets
-        # This protects against _snapshot_path_delete's destructive nature (it deletes 'create' snapshots)
-        for target_uri in targets:
-            # Backup path snapshot
-            existing_path_snap = manager.get_snapshot(session_id, target_uri)
-            if existing_path_snap:
-                backup_snapshots.append(existing_path_snap)
-            
-            # Backup content snapshot (if any)
-            # _snapshot_path_delete might wipe this too if it's reverting a creation
-            content_snap_id = manager.find_memory_snapshot_by_uri(session_id, target_uri)
-            if content_snap_id:
-                existing_content_snap = manager.get_snapshot(session_id, content_snap_id)
-                if existing_content_snap:
-                    backup_snapshots.append(existing_content_snap)
+        _record_rows(
+            before_state=snapshot_before,
+            after_state={},
+        )
 
-        # 3. Apply deletion snapshots
-        for target_uri in targets:
-            if await _snapshot_path_delete(target_uri):
-                newly_created_snapshots.append(target_uri)
-
-        # 4. Remove the path (recursive=True allows cascade delete)
-        result = await client.remove_path(path, domain, recursive=True)
-
-        deleted_paths = result.get("deleted_paths", [])
-        descendant_count = len(deleted_paths) - 1  # exclude the target itself
-
+        deleted_path_count = len(snapshot_before.get("paths", []))
+        descendant_count = max(0, deleted_path_count - 1)
         msg = f"Success: Memory '{full_uri}' deleted."
         if descendant_count > 0:
             msg += f" (Recursively removed {descendant_count} descendant path(s))"
 
         return msg
 
+    except ValueError as e:
+        return f"Error: {str(e)}"
     except Exception as e:
-        # ROLLBACK STRATEGY
-        # 1. Remove any snapshots we just created (clean up the 'delete' markers)
-        for snap_uri in newly_created_snapshots:
-            manager.delete_snapshot(session_id, snap_uri)
-            
-        # 2. RESTORE any snapshots we destroyed (bring back 'create'/'modify' markers)
-        for snap in backup_snapshots:
-            manager.create_snapshot(
-                session_id=session_id,
-                resource_id=snap["resource_id"],
-                resource_type=snap["resource_type"],
-                snapshot_data=snap["data"],
-                force=True # Force overwrite to ensure restoration
-            )
-            
         return f"Error: {str(e)}"
 
 
@@ -1028,12 +796,9 @@ async def add_alias(
             disclosure=disclosure,
         )
 
-        # Record alias path creation for potential rollback
-        await _snapshot_path_create(
-            uri=result["new_uri"],
-            memory_id=result["memory_id"],
-            operation_type="create_alias",
-            target_uri=result["target_uri"],
+        _record_rows(
+            before_state={},
+            after_state=result.get("rows_after", {}),
         )
 
         return f"Success: Alias '{result['new_uri']}' now points to same memory as '{result['target_uri']}'"
