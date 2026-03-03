@@ -1,6 +1,6 @@
-from sqlalchemy import text, DateTime
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy import inspect as sa_inspect, dialects
+from sqlalchemy import inspect as sa_inspect
 
 async def up(engine: AsyncEngine):
     """

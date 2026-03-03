@@ -15,7 +15,7 @@ import uuid as uuid_lib
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from sqlalchemy import (
     Column,
@@ -220,9 +220,11 @@ class SQLiteClient:
             is_local = parsed.hostname in ("localhost", "127.0.0.1", "::1")
 
             connect_args = {}
-            # Check if SSL is explicitly disabled via query parameter
-            parsed_qs = dict(pair.split("=") for pair in (parsed.query.split("&") if parsed.query else []) if "=" in pair)
-            ssl_disabled = parsed_qs.get("ssl", "").lower() in ("disable", "false", "off")
+            # Use robust query parsing. Values may legally contain '='.
+            parsed_qs = parse_qs(parsed.query, keep_blank_values=True)
+            ssl_values = parsed_qs.get("ssl", []) + parsed_qs.get("sslmode", [])
+            ssl_value = ssl_values[-1].lower() if ssl_values else ""
+            ssl_disabled = ssl_value in ("disable", "false", "off", "0", "no")
 
             if not is_local and not ssl_disabled:
                 # Remote PostgreSQL: enable SSL and disable prepared statement
