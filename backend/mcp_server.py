@@ -216,6 +216,10 @@ async def lifespan(server: FastMCP):
     web_task = None
     try:
         db_manager = get_db_manager()
+
+        os.makedirs("/data", exist_ok=True)
+        os.makedirs("/data/snapshots", exist_ok=True)
+
         if os.environ.get("SKIP_DB_INIT", "").lower() not in ("true", "1", "yes"):
             await db_manager.init_db()
 
