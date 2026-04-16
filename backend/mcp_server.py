@@ -128,10 +128,10 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
                 return
                 
             if not self.dist.is_dir():
-                from starlette.responses import PlainTextResponse
-                await PlainTextResponse(
-                    "Admin UI is building or missing. Please refresh in a moment...", 
-                    status_code=503
+                from starlette.responses import JSONResponse
+                await JSONResponse(
+                    {"error": "Not Found"}, 
+                    status_code=404
                 )(scope, receive, send)
                 return
 
@@ -147,8 +147,8 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
             if index_file.is_file():
                 await FileResponse(index_file)(scope, receive, send)
             else:
-                from starlette.responses import PlainTextResponse
-                await PlainTextResponse("Admin UI missing index.html.", status_code=404)(scope, receive, send)
+                from starlette.responses import JSONResponse
+                await JSONResponse({"error": "Not Found"}, status_code=404)(scope, receive, send)
 
     return _Fallback(authed, FRONTEND_DIR)
 
