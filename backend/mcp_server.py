@@ -106,7 +106,7 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
 
     inner = Starlette(routes=routes, lifespan=lifespan)
     authed = NamespaceMiddleware(
-        BearerTokenAuthMiddleware(inner, excluded_paths=["/api/health", "/health"])
+        BearerTokenAuthMiddleware(inner, excluded_paths=["/api/health", "/health", "/.well-known", "/mcp/.well-known"])
     )
 
     backend_prefixes = tuple(["/api", "/health"] + list(extra_prefixes or []))
