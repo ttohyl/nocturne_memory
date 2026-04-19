@@ -1224,16 +1224,22 @@ async def create_memory(
 
         try:
             from embedding import embed_and_find_related
-            memory_id = result.get("memory_id")
+            from sqlalchemy import select
+            from db.models import Memory
             node_uuid = result.get("node_uuid")
-            if memory_id and node_uuid:
+            if node_uuid:
                 db = get_db_manager()
                 async with db.session() as session:
-                    related = await embed_and_find_related(session, content, memory_id, node_uuid)
-                    if related:
-                        base_msg += related
+                    mem = (await session.execute(
+                        select(Memory).where(Memory.node_uuid == node_uuid, Memory.deprecated == False)
+                    )).scalar_one_or_none()
+                    if mem:
+                        related = await embed_and_find_related(session, content, mem.id, node_uuid)
+                        if related:
+                            base_msg += related
         except Exception as e:
-            logger.warning(f"Embedding enrichment failed (non-blocking): {e}")
+            import traceback
+            logger.warning(f"Embedding enrichment failed (non-blocking): {e}\n{traceback.format_exc()}")
 
         return base_msg
 
