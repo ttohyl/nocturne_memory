@@ -14,3 +14,4 @@ filelock>=3.10.0       # File locking for JSON snapshot concurrency
 sqlalchemy>=2.0.0
 aiosqlite>=0.19.0    # SQLite async driver
 asyncpg>=0.29.0      # PostgreSQL async driver
+pgvector>=0.3.0      # Vector similarity search (embedding)

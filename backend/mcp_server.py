@@ -1213,7 +1213,7 @@ async def create_memory(
         created_uri = result.get("uri", make_uri(domain, result["path"]))
         _record_rows(before_state={}, after_state=result.get("rows_after", {}))
 
-        return (
+        base_msg = (
             f"Success: Memory created at '{created_uri}'\\n\\n"
             f"[SYSTEM REMINDER]: Look around your memory network. Are there existing memories related to this one? "
             f"Would reading them trigger a need to recall this new memory? If yes, link them!\\n"
@@ -1221,6 +1221,21 @@ async def create_memory(
             f"- If the related memories are many and this memory's scope is broad, consider using `manage_triggers`.\\n"
             f"- (Never invent arbitrary placeholder words just to force a trigger.)"
         )
+
+        try:
+            from embedding import embed_and_find_related
+            memory_id = result.get("memory_id")
+            node_uuid = result.get("node_uuid")
+            if memory_id and node_uuid:
+                db = get_db_manager()
+                async with db.session() as session:
+                    related = await embed_and_find_related(session, content, memory_id, node_uuid)
+                    if related:
+                        base_msg += related
+        except Exception as e:
+            logger.warning(f"Embedding enrichment failed (non-blocking): {e}")
+
+        return base_msg
 
     except ValueError as e:
         return f"Error: {str(e)}"

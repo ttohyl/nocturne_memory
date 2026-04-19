@@ -24,6 +24,10 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    Vector = None
 
 Base = declarative_base()
 
@@ -102,6 +106,7 @@ class Memory(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     node_uuid = Column(String(36), ForeignKey("nodes.uuid"), nullable=True)
     content = Column(Text, nullable=False)
+    embedding = Column(Vector(768), nullable=True) if Vector else Column(Text, nullable=True)
     deprecated = Column(Boolean, default=False)
     migrated_to = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
