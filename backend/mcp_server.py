@@ -1725,6 +1725,48 @@ async def search_memory(
         return f"Error: {str(e)}"
 
 
+@write_tool()
+async def trigger_backfill() -> str:
+    """Admin: backfill embeddings for all memories that don't have one yet.
+
+    Safe to call multiple times — skips memories that already have embeddings.
+    Typical runtime: ~20-30s for 46 nodes (Nomic API, ~500ms each).
+    """
+    from sqlalchemy import select
+    from db.models import Memory
+    from embedding import compute_embedding, store_embedding
+
+    db = get_db_manager()
+    done = skipped = errors = 0
+
+    async with db.session() as session:
+        result = await session.execute(
+            select(Memory).where(
+                Memory.embedding.is_(None),
+                Memory.deprecated == False,
+            )
+        )
+        memories = result.scalars().all()
+        total = len(memories)
+
+        if total == 0:
+            return "All memories already have embeddings. Nothing to backfill."
+
+        for mem in memories:
+            try:
+                emb = await compute_embedding(mem.content or "")
+                if emb:
+                    await store_embedding(session, mem.id, emb)
+                    await session.commit()
+                    done += 1
+                else:
+                    skipped += 1
+            except Exception:
+                errors += 1
+
+    return f"Backfill complete: {done} embedded, {skipped} skipped, {errors} errors, {total} total"
+
+
 # =============================================================================
 # MCP Resources
 # =============================================================================
