@@ -102,7 +102,7 @@ class Memory(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     node_uuid = Column(String(36), ForeignKey("nodes.uuid"), nullable=True)
     content = Column(Text, nullable=False)
-    # embedding = Column(Text, nullable=True)  # TODO: uncomment after migration 013 confirmed
+    embedding = Column(Text, nullable=True)  # JSON array of 768d floats (nomic-embed-text)
     deprecated = Column(Boolean, default=False)
     migrated_to = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
