@@ -118,13 +118,22 @@ async def embed_and_find_related(
     node_uuid: str,
 ) -> str:
     """Compute embedding, store it, find related memories. Returns formatted string."""
+    logger.info(f"[EMBED] Start: memory_id={memory_id}, node_uuid={node_uuid[:8]}")
+
     embedding = await compute_embedding(content)
     if not embedding:
+        logger.warning(f"[EMBED] compute_embedding returned None — skipping")
         return ""
 
+    logger.info(f"[EMBED] Got embedding dim={len(embedding)}")
+
     await store_embedding(session, memory_id, embedding)
+    await session.commit()
+    logger.info(f"[EMBED] Stored + committed embedding for memory {memory_id}")
 
     similar = await find_similar_memories(session, embedding, limit=3, exclude_node_uuid=node_uuid)
+    logger.info(f"[EMBED] find_similar returned {len(similar)} results")
+
     if not similar:
         return ""
 
@@ -132,4 +141,6 @@ async def embed_and_find_related(
     for mem in similar:
         lines.append(f"  - {mem['node_uuid'][:8]}... (similarity: {mem['similarity']}) — {mem['content_preview'][:100]}...")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    logger.info(f"[EMBED] Returning related text, length={len(result)}")
+    return result
