@@ -1,4 +1,4 @@
-"""One-time migration: add pgvector extension + embedding column to memories table."""
+"""One-time migration: add embedding TEXT column to memories table (SQLite compatible)."""
 
 import asyncio
 import os
@@ -15,13 +15,17 @@ async def migrate():
     await db.init_db()
 
     async with db.session() as session:
-        await session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await session.execute(
-            text("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768)")
-        )
-        await session.commit()
-
-    print("Migration done: pgvector extension + embedding column added.")
+        try:
+            await session.execute(
+                text("ALTER TABLE memories ADD COLUMN embedding TEXT")
+            )
+            await session.commit()
+            print("Migration done: embedding TEXT column added.")
+        except Exception as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                print("Column already exists, skipping.")
+            else:
+                raise
 
 
 if __name__ == "__main__":
