@@ -45,8 +45,13 @@ def get_api_token() -> str | None:
     return os.environ.get("API_TOKEN")
 
 
-def _unauthorized_response() -> JSONResponse:
-    return JSONResponse(status_code=401, content=UNAUTHORIZED_MESSAGE)
+def _unauthorized_response(server_url: str | None = None) -> JSONResponse:
+    headers: dict[str, str] = {}
+    if server_url:
+        headers["WWW-Authenticate"] = (
+            f'Bearer resource_metadata="{server_url.rstrip("/")}/.well-known/oauth-protected-resource"'
+        )
+    return JSONResponse(status_code=401, content=UNAUTHORIZED_MESSAGE, headers=headers)
 
 
 async def verify_token(
@@ -95,14 +100,17 @@ class BearerTokenAuthMiddleware:
         self,
         app: ASGIApp,
         excluded_paths: Sequence[str] | None = None,
+        oauth_provider: object | None = None,
+        server_url: str | None = None,
     ) -> None:
         self.app = app
         self.excluded_paths = tuple(excluded_paths or ())
         self.expected_token = get_api_token()
+        self.oauth_provider = oauth_provider
+        self.server_url = server_url
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        # 如果没有配置 Token，直接放行所有 HTTP 请求
-        if not self.expected_token:
+        if not self.expected_token and not self.oauth_provider:
             await self.app(scope, receive, send)
             return
 
@@ -116,12 +124,28 @@ class BearerTokenAuthMiddleware:
             return
 
         request = Request(scope, receive=receive)
-        response = await verify_token(request, expected_token=self.expected_token)
-        if response is not None:
-            await response(scope, receive, send)
-            return
 
-        await self.app(scope, receive, send)
+        # Check 1: static API_TOKEN
+        if self.expected_token:
+            response = await verify_token(request, expected_token=self.expected_token)
+            if response is None:
+                await self.app(scope, receive, send)
+                return
+
+        # Check 2: OAuth token
+        if self.oauth_provider:
+            authorization = request.headers.get("Authorization", "")
+            if authorization.startswith("Bearer "):
+                provided = authorization.removeprefix("Bearer ").strip()
+                if provided:
+                    access_token = await self.oauth_provider.load_access_token(provided)
+                    if access_token is not None:
+                        await self.app(scope, receive, send)
+                        return
+
+        # Both checks failed — 401
+        resp = _unauthorized_response(self.server_url)
+        await resp(scope, receive, send)
 
 
 __all__ = [

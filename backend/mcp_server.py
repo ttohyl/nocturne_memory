@@ -78,6 +78,7 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
     from namespace_middleware import NamespaceMiddleware
     from api import review_router, browse_router, maintenance_router
     from health import router as health_router, health_check
+    from oauth_provider import create_oauth_provider, get_oauth_routes
 
     api = FastAPI(
         title="Nocturne Memory API",
@@ -96,7 +97,12 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
     api.include_router(browse_router)
     api.include_router(maintenance_router)
 
+    oauth_provider = create_oauth_provider()
+    oauth_server_url = os.getenv("NOCTURNE_SERVER_URL", "")
+
     routes = list(extra_routes or [])
+    if oauth_provider:
+        routes.extend(get_oauth_routes(oauth_provider))
     routes.append(Mount("/api", app=api))
 
     async def _health_endpoint(request):
@@ -104,12 +110,24 @@ def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
 
     routes.append(Route("/health", endpoint=_health_endpoint))
 
+    oauth_excluded = [
+        "/.well-known", "/mcp/.well-known",
+        "/authorize", "/token", "/register", "/revoke",
+        "/login", "/login/callback",
+    ]
+
     inner = Starlette(routes=routes, lifespan=lifespan)
     authed = NamespaceMiddleware(
-        BearerTokenAuthMiddleware(inner, excluded_paths=["/api/health", "/health", "/.well-known", "/mcp/.well-known"])
+        BearerTokenAuthMiddleware(
+            inner,
+            excluded_paths=["/api/health", "/health"] + oauth_excluded,
+            oauth_provider=oauth_provider,
+            server_url=oauth_server_url or None,
+        )
     )
 
-    backend_prefixes = tuple(["/api", "/health"] + list(extra_prefixes or []))
+    oauth_prefixes = ["/.well-known", "/authorize", "/token", "/register", "/login"]
+    backend_prefixes = tuple(["/api", "/health"] + oauth_prefixes + list(extra_prefixes or []))
 
     class _Fallback:
         """Route backend prefixes to the inner app; everything else to the SPA."""
@@ -1423,6 +1441,27 @@ async def update_memory(
             before_state=result.get("rows_before", {}),
             after_state=result.get("rows_after", {}),
         )
+
+        # Recalculate embedding if content changed
+        if content is not None:
+            try:
+                from embedding import compute_embedding, store_embedding
+                from sqlalchemy import select
+                from db.models import Memory as MemModel
+                node_uuid = result.get("node_uuid")
+                if node_uuid:
+                    db = get_db_manager()
+                    async with db.session() as session:
+                        mem = (await session.execute(
+                            select(MemModel).where(MemModel.node_uuid == node_uuid, MemModel.deprecated == False)
+                        )).scalar_one_or_none()
+                        if mem:
+                            emb = await compute_embedding(content)
+                            if emb:
+                                await store_embedding(session, mem.id, emb)
+                                await session.commit()
+            except Exception:
+                pass  # Non-blocking: embedding update failure shouldn't break the update
 
         return f"Success: Memory at '{full_uri}' updated"
 
