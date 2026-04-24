@@ -279,3 +279,22 @@ async def remove_glossary_keyword(body: GlossaryRemove):
     if not result.get("success"):
         raise HTTPException(status_code=404, detail="Keyword binding not found")
     return {"success": True}
+
+
+@router.get("/recall")
+async def recall_by_context(
+    text: str = Query(..., description="Context text to match against"),
+    limit: int = Query(5, ge=1, le=10),
+):
+    """Semantic recall: find memories related to the given text via embedding similarity.
+
+    Returns lightweight pointers (URI + disclosure + similarity).
+    """
+    from embedding import find_similar_with_context
+
+    db = get_db_manager()
+    async with db.session() as session:
+        pointers = await find_similar_with_context(
+            session, text, limit=limit, namespace=get_namespace()
+        )
+    return pointers
