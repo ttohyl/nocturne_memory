@@ -111,6 +111,66 @@ async def find_similar_memories(
     return scored[:limit]
 
 
+async def find_similar_with_context(
+    session: AsyncSession,
+    query_text: str,
+    limit: int = 5,
+    namespace: str = "",
+) -> list[dict]:
+    """Find top-k similar memories with URI + disclosure for pointer-based recall.
+
+    Returns lightweight pointers: {uri, disclosure, similarity} — enough to judge
+    relevance without reading full content. Designed for per-turn association.
+    """
+    from db.models import Edge, Path
+
+    embedding = await compute_embedding(query_text)
+    if not embedding:
+        return []
+
+    result = await session.execute(
+        select(Memory).where(
+            Memory.embedding.isnot(None),
+            Memory.deprecated == False,
+        )
+    )
+    memories = result.scalars().all()
+
+    scored = []
+    for mem in memories:
+        try:
+            stored_vec = json.loads(mem.embedding)
+            sim = cosine_similarity(embedding, stored_vec)
+            scored.append((mem.node_uuid, sim))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:limit]
+
+    pointers = []
+    for node_uuid, sim in top:
+        path_result = await session.execute(
+            select(Path.domain, Path.path, Edge.disclosure)
+            .select_from(Path)
+            .join(Edge, Path.edge_id == Edge.id)
+            .where(Edge.child_uuid == node_uuid, Path.namespace == namespace)
+            .order_by(Path.path)
+            .limit(1)
+        )
+        row = path_result.first()
+        if row:
+            uri = f"{row[0]}://{row[1]}"
+            disclosure = row[2] or "(no disclosure)"
+            pointers.append({
+                "uri": uri,
+                "disclosure": disclosure,
+                "similarity": round(sim, 3),
+            })
+
+    return pointers
+
+
 async def embed_and_find_related(
     session: AsyncSession,
     content: str,

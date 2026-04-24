@@ -1764,6 +1764,50 @@ async def search_memory(
         return f"Error: {str(e)}"
 
 
+@mcp.tool()
+async def recall_by_context(text: str, limit: int = 5) -> str:
+    """
+    Semantic recall: find memories related to the given text via embedding similarity.
+
+    Returns lightweight pointers (URI + disclosure + similarity score) — NOT full content.
+    Use this to discover which memories are relevant before deciding whether to read_memory.
+
+    This is the "聯想" (association) mechanism: memories come to you, you don't search for them.
+
+    Args:
+        text: The context text to match against (e.g., user's message, current topic)
+        limit: Maximum results (default 5)
+
+    Returns:
+        List of URI + disclosure pointers, sorted by relevance
+
+    Examples:
+        recall_by_context("如何處理審計平台的 roadmap")
+        recall_by_context("Thomas 今天心情不好", limit=3)
+    """
+    try:
+        from embedding import find_similar_with_context
+        db = get_db_manager()
+        async with db.session() as session:
+            pointers = await find_similar_with_context(
+                session, text, limit=min(limit, 10), namespace=get_namespace()
+            )
+
+        if not pointers:
+            return "No related memories found."
+
+        lines = [f"Found {len(pointers)} related memories:\n"]
+        for p in pointers:
+            lines.append(f"- {p['uri']} (similarity: {p['similarity']})")
+            lines.append(f"  {p['disclosure']}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
 @write_tool()
 async def trigger_backfill() -> str:
     """Admin: backfill embeddings for all memories that don't have one yet.
